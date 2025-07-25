@@ -13,7 +13,7 @@ from ReplayBuffer import ReplayBuffer
 #Arquivo inicial
 
 #Criação do ambiente PusherV4 e outras variáveis 
-ambiente = gym.make("Pusher-v4", render_mode="human") #
+ambiente = gym.make("Pusher-v4", render_mode="human") # "human"
 
 obsDim = ambiente.observation_space.shape[0] #Armazena a dimensão do espaço de observação (23)
 acaoDim = ambiente.action_space.shape[0] #Armazena a dimensão do espaço de ações (7)
@@ -21,19 +21,20 @@ acaoLimite = 2 #Armazena o limite máximo de cada ação (intervalo [-2, 2])
 
 estadoAtual = ambiente.reset()[0]  #Retorna o estado atual do ambiente
 
-sigmaRuido = 0.2 #Parâmetro de ruído (desvio padrão da gaussiana)
-decaimentoRuido = 0.992 #Diminui a qtde de ruido (conforme a exploração avança)
+sigmaRuido = 0.15 #Parâmetro de ruído (desvio padrão da gaussiana)
+decaimentoRuido = 0.997 #Diminui a qtde de ruido (conforme a exploração avança)
 
-qtdeEpisodios = 500 
-passosPorEpisodio = 70
+qtdeEpisodios = 1000 
+passosPorEpisodio = 100
 
 # Parâmetros de Treinamento DDPG
-gamma = 0.99  # Fator de desconto para recompensas futuras
-tau = 0.005   # Taxa de atualização suave para as redes alvo
+gamma = 0.99 # Fator de desconto para recompensas futuras
+tau = 0.003 # Taxa de atualização suave para as redes alvo
 lr_atuador = 1e-4 # Taxa de aprendizado do atuador
 lr_critico = 1e-3 # Taxa de aprendizado do crítico
 batch_size = 256  # Tamanho do lote para amostragem do ReplayBuffer
-delay_treinamento = 1000 # Número de passos antes de começar a treinar (para preencher o buffer)
+#delay_treinamento = 10000 # Número de passos antes de começar a treinar (para preencher o buffer)
+delay_treinamento = 0 # Caso um arquivo de buffer seja carregado
 atualizacoes_por_passo = 3 # Número de vezes que o agente treina por passo de ambiente
 
 # Criação do atuador e crítico
@@ -53,8 +54,9 @@ otimizador_atuador = optim.Adam(atuador.parameters(), lr=lr_atuador)
 otimizador_critico = optim.Adam(critico.parameters(), lr=lr_critico)
 
 # Instancia o ReplayBuffer 
-buffer_capacidade = 1_000_000 # Exemplo: 1 milhão de transições
+buffer_capacidade = 200_000
 buffer = ReplayBuffer(buffer_capacidade, obsDim, acaoDim)
+buffer.carregar("buffer_ep500.npz") #Carregamento de arquivo de buffer (.npz)
 
 total_passos = 0
 
@@ -72,6 +74,7 @@ for episodio in range(qtdeEpisodios):
         media = buffer.media_estado()
         desvio = buffer.desvio_estado()
         estado_normalizado = (estadoAtual - media) / (desvio + 1e-8)
+        
         # Seleção de Ação (Exploração vs. Explotação)
         # O atuador não precisa de torch.no_grad() aqui porque o gradiente é necessário para o treino do atuador
         # Mas para a coleta de dados, a ação em si não é usada para treinar o atuador ainda.
@@ -89,6 +92,7 @@ for episodio in range(qtdeEpisodios):
 
         # Executa a ação no ambiente
         novoEstado, recompensa, finalizado, truncado, info = ambiente.step(acaoComRuido)
+        recompensa = info["reward_dist"] + 0.1 * info["reward_ctrl"]
         recompensa_acumulada += recompensa
 
         # Adiciona transição no ReplayBuffer
@@ -121,8 +125,14 @@ for episodio in range(qtdeEpisodios):
 
                     # Se o episódio terminou, o Q do próximo estado é 0
                     alvo_q = batch_recompensas + gamma * (1 - batch_finalizados) * proximos_q_valores
+                    alvo_q = torch.clamp(alvo_q, min=-10.0, max=10.0)
 
                 q_predito = critico(batch_estados, batch_acoes) # Q-valor predito pelo crítico principal
+                q_predito = torch.clamp(q_predito, min=-10.0, max=10.0)
+                
+                if total_passos % 10 == 0:
+                    print(f"Alvo Q media: {alvo_q.mean().item():.4f} | Q predito media: {q_predito.mean().item():.4f}")
+                    print(f"Erro Médio Absoluto Q: {(q_predito - alvo_q).abs().mean().item():.4f}")
 
                 perda_critico = F.mse_loss(q_predito, alvo_q) # Erro quadrático médio
                 perda_critico.backward() # Backpropagation
@@ -134,9 +144,12 @@ for episodio in range(qtdeEpisodios):
                 # As ações são geradas pelo atuador principal para maximizar o Q predito pelo crítico principal
                 acoes_atuador = atuador(batch_estados)
                 perda_atuador = -critico(batch_estados, acoes_atuador).mean() # Maximiza o Q -> minimiza -Q
-                
+                    
                 perda_atuador.backward() # Backpropagation
                 otimizador_atuador.step() # Atualiza os pesos do atuador
+                    
+                if total_passos % 10 == 0:
+                    print(f"[Ep {episodio+1:4} | Passo {total_passos:6}] Perda Crítico: {perda_critico.item():.4f} | Perda Atuador: {perda_atuador.item():.4f}")
 
                 # 5. Atualizar as Redes Alvo (Soft Update)
                 # target_weights = tau * main_weights + (1 - tau) * target_weights
@@ -149,11 +162,12 @@ for episodio in range(qtdeEpisodios):
         if finalizado or truncado:
             break
 
-        estadoAtual = novoEstado # Pequeno atraso para visualização
-        time.sleep(0.01)
+        estadoAtual = novoEstado
+        #time.sleep(0.0005) # Pequeno atraso para visualização
     
     # Aplica o decaimento no ruído
-    sigmaRuido *= decaimentoRuido
+    sigmaRuido = max(sigmaRuido * decaimentoRuido, 0.05)
+   
     print(f"  Recompensa Acumulada no Episódio: {recompensa_acumulada:.2f}")
 
     #Avaliação sem ruído a cada 50 episódios
